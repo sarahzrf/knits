@@ -1,7 +1,11 @@
 {-# LANGUAGE DeriveFunctor, DeriveTraversable #-}
+{-# LANGUAGE TemplateHaskell #-}
 module Knits where
 
 import Data.List
+import Control.Lens
+import Control.Monad
+import Control.Monad.State
 
 -- Fundamental types
 
@@ -29,7 +33,7 @@ data Stitch ref = Stitch [(ref, DirectionThru)]
 -- previous stitches in the form of list offsets (not indices! i.e., a ref of 0
 -- means the previous stitch, 1 means the one before that, etc).
 newtype Offset = Offset {getOffset :: Int} deriving (Eq, Ord, Show)
-data Fabric = Fabric {getStitches :: [Stitch Offset]} deriving (Show)
+data Fabric = Fabric {sts :: [Stitch Offset]} deriving (Show)
 
 
 -- Knitting
@@ -43,8 +47,9 @@ newtype StitchID = StitchID {getStitchID :: Int} deriving (Eq, Ord, Show)
 -- stitches in a Fabric; i.e., the most recent stitch is first. That way,
 -- making new stitches is just cons instead of snoc.
 data WorkingFabric =
-  WorkingFabric {getWorkingStitches :: [(StitchID, Stitch StitchID)]}
+  WorkingFabric {_workingSts :: [(StitchID, Stitch StitchID)]}
   deriving (Show)
+makeLenses ''WorkingFabric
 
 -- Utility function: Map over a list, but the mapping function gets to see the
 -- whole tail.
@@ -61,7 +66,7 @@ finish (WorkingFabric sts) = Fabric . reverse <$> sequence (walk reref sts)
 -- Normal knitting is a pair of stacks; circular knitting is a queue. This
 -- class lets us be polymorphic over the nature of our needles.
 class Needles n where
-  popLeft :: n -> Maybe (n, StitchID)
+  popLeft :: n -> Maybe (StitchID, n)
   pushRight :: StitchID -> n -> n
   -- In normal knitting, we flip which side is up when we exhaust the stitches
   -- on the left. To be generic, we'll let the needles value tell us whether
@@ -73,12 +78,15 @@ data TwoNeedles =
   TwoNeedles {
     leftNeedle :: [StitchID],
     rightNeedle :: [StitchID],
-    sideUp_ :: DirectionThru}
-  deriving (Show)
+    sideUp_ :: DirectionThru
+  } deriving (Show)
+
+emptyTN :: TwoNeedles
+emptyTN = TwoNeedles [] [] Over
 
 instance Needles TwoNeedles where
   popLeft (TwoNeedles l r s) = case (l, r) of
-    (id:ids, _) -> Just (TwoNeedles ids r s, id)
+    (id:ids, _) -> Just (id, TwoNeedles ids r s)
     -- flip the work when we run out of stitches on the left
     ([], _:_) -> popLeft (TwoNeedles r [] (flipDir s))
     ([], []) -> Nothing
@@ -92,12 +100,15 @@ instance Needles TwoNeedles where
 data CircularNeedles =
   CircularNeedles {
     leftTip :: [StitchID],
-    rightTip :: [StitchID]}
-  deriving (Show)
+    rightTip :: [StitchID]
+  } deriving (Show)
+
+emptyCN :: CircularNeedles
+emptyCN = CircularNeedles [] []
 
 instance Needles CircularNeedles where
   popLeft (CircularNeedles l r) = case (l, r) of
-    (id:ids, _) -> Just (CircularNeedles ids r, id)
+    (id:ids, _) -> Just (id, CircularNeedles ids r)
     -- slide the right-hand stitches along the cable when we run out of
     -- stitches on the left
     ([], _:_) -> popLeft (CircularNeedles (reverse r) [])
@@ -108,4 +119,51 @@ instance Needles CircularNeedles where
   sideUp _ = Over
 
 -- TODO: Factor out the common logic for those two.
+
+-- The state type for the process of knitting.
+data Knitter n =
+  Knitter {
+    _workingFabric :: WorkingFabric,
+    _needles :: n,
+    _maxIDi :: Int
+  } deriving (Show)
+makeLenses ''Knitter
+
+castOn :: Needles n => Int -> n -> Knitter n
+castOn count e = Knitter (WorkingFabric wsts) needle (count - 1)
+  where ids = map StitchID [0..count - 1]
+        needle = foldl' (flip pushRight) e ids
+        wsts = zip (reverse ids) (repeat (Stitch []))
+
+type Pattern n = StateT (Knitter n) Maybe
+
+-- The basic stitches!
+-- TODO: Factor out, these are 99% identical.
+-- TODO: Maybe write some comments?
+k, p :: Needles n => Pattern n ()
+k = do
+  live <- zoom needles (StateT popLeft)
+  dir <- use (needles.to sideUp)
+  nextIDi <- maxIDi <+= 1
+  let newStitch = Stitch [(live, dir)]
+      nextID = StitchID nextIDi
+  workingFabric.workingSts %= ((nextID, newStitch):)
+  needles %= pushRight nextID
+p = do
+  live <- zoom needles (StateT popLeft)
+  dir <- use (needles.to sideUp)
+  nextIDi <- maxIDi <+= 1
+  let newStitch = Stitch [(live, flipDir dir)]
+      nextID = StitchID nextIDi
+  workingFabric.workingSts %= ((nextID, newStitch):)
+  needles %= pushRight nextID
+
+
+-- try `demoFabric emptyTN' and `demoFabric emptyCN'!
+demoFabric :: Needles n => n -> Maybe Fabric
+demoFabric n = do
+  let pattern = replicateM_ 30 k
+      knitter = castOn 10 n
+  knitter' <- execStateT pattern knitter
+  finish (_workingFabric knitter')
 
